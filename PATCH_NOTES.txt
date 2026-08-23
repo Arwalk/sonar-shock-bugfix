@@ -1,0 +1,52 @@
+SONAR SHOCK — COMMUNITY BUGFIX PATCH
+=====================================
+Applied to: Sonar Shock.pck (Godot 4.2.2). The original file is preserved
+unmodified as "Sonar Shock.pck.orig" — restore it by deleting the patched
+"Sonar Shock.pck" and renaming the .orig back. The exe, Steam DLLs, and your
+save files are untouched, and existing saves remain fully compatible.
+
+WHAT WAS FIXED
+--------------
+1. Stuck under objects after crouching (movement)
+   - Standing up was gated by a single zero-width ray at the player's center,
+     so standing under the EDGE of a shelf/table/duct passed the check while
+     the growing body clipped the object, wedging the player permanently.
+     Standing clearance is now a full-body capsule test.
+   - The crouch animation shrank the collider with a non-uniform scale, which
+     Godot physics does not support reliably, and regrew it over 0.2 s AFTER
+     the check. The collider is now resized exactly and instantly at the
+     moment the clearance check passes.
+   - New safety net: if the player ever ends up embedded in geometry from
+     above (closing doors, elevators, old "stuck" saves), the game now
+     auto-ducks them free ("Forced to crouch.") within a fraction of a second.
+   - Respawning while crouched no longer force-stands you into an obstacle.
+
+2. Performance decay over long sessions (the "memory leak")
+   - Bullet holes, shell casings, and blood were parented to the scene root
+     and, with the default decal lifetime setting ("OFF" = keep forever),
+     were never deleted — hit-blood sprites survived even level changes,
+     deaths, and returning to the menu. After a few hours, thousands of live
+     objects crushed the framerate until a full game restart.
+   - Decals now register in a bounded registry: the newest 300 bullet holes,
+     250 blood effects, and 150 casings are kept and the oldest are recycled.
+     Level transitions now also clean up hit-blood correctly.
+   - The decal lifetime option still works exactly as before; "OFF" now means
+     "until recycled by the cap" instead of "leak forever".
+
+3. Elevator softlock (low sanity)
+   - The "crazy elevator ride" rolled a random destination with float
+     arguments (randi_range(0.6, 5.4)), which could produce 0 — matching no
+     destination, so the elevator closed its doors and did nothing. The roll
+     is now a proper 1..5.
+
+4. Smaller fixes
+   - Level unloading now uses deferred deletion (queue_free) instead of
+     freeing live maps mid-frame (crash risk).
+   - bullethole4.gd had "speed_scale == randf_range(...)" (a comparison doing
+     nothing) instead of an assignment — dragonbreath decal flicker variance
+     restored.
+
+FILES CHANGED INSIDE THE PCK (12 scripts, all plain GDScript)
+  player.gd, new_manager.gd, Maps/main_scene.gd, bullethole2.gd,
+  bullethole4.gd, bullethole5.gd, bullethole7.gd, bullethole_melee.gd,
+  sword_bullethole.gd, blood_splatter.gd, blood_sprite.gd, random/casing1.gd

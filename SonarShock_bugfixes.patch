@@ -1,0 +1,583 @@
+SONAR SHOCK — COMMUNITY BUGFIX PATCH (for upstream)
+====================================================
+From a player, with respect — the game is great; these are fixes for the two
+bugs that hurt the most in long sessions (getting permanently stuck after
+crouching, and the framerate collapsing over time), plus a few small ones
+found along the way.
+
+Scope: 12 GDScript files, 134 insertions / 13 deletions. No scenes, resources,
+project settings, or save formats are touched. All added helpers/vars are
+prefixed sp_ to avoid collisions. The diff was taken against the scripts of
+the 4.2.2 Steam build (they ship as plain text in the pck), so it should apply
+cleanly to the project unless these files changed after that build.
+
+HOW TO APPLY
+------------
+Paths are relative to the Godot project root (the folder with project.godot):
+
+    git apply SonarShock_bugfixes.patch        # in a git checkout
+    patch -p1 < SonarShock_bugfixes.patch      # plain patch(1)
+
+Everything below explains each change; the unified diff follows at the end.
+
+
+--------------------------------------------------------------------------
+1. PLAYER PERMANENTLY STUCK UNDER OBJECTS AFTER CROUCHING   (player.gd)
+--------------------------------------------------------------------------
+Root cause — two problems combining:
+
+  a) Standing up is gated by $crouch_check, a single RayCast3D on the
+     player's center axis (origin y=0.95, pointing up 1.2 m). The player's
+     body is a capsule of radius 0.5. Crouched under the EDGE of an overhang
+     (a shelf/table/duct that covers part of the capsule but not the center
+     axis), the ray reports "clear" while the standing capsule would
+     intersect the obstacle.
+
+  b) The crouch collider change is done by the "crouch" AnimationPlayer's
+     "new_animation" animating body:scale from (1,1,1) to (1,0.5,1).
+     Non-uniform scaling of collision shapes is unsupported by Godot physics
+     (capsules especially — the editor warns about this), and on standing up
+     the capsule re-grows interpolated over 0.2 s AFTER the ray check passed,
+     so the player can also drift further under an obstacle while the
+     collider is still growing.
+
+  Consequence: the standing capsule ends up deeply overlapping static
+  geometry. move_and_slide() cannot recover from deep penetration, so the
+  player is wedged permanently — walking and standing both fail, and only
+  reloading helps. Respawning also force-uncrouched with no check at all
+  (second occurrence in _process), which could wedge a player who saved
+  while crouched somewhere low.
+
+What the patch does (player.gd only, scene untouched):
+
+  * sp_apply_crouch_shape(is_crouched): resizes the capsule in code,
+    instantly — height 2.0 <-> 1.0 and CollisionShape3D position y
+    1.0 <-> 0.5118. These are numerically identical to the END pose of the
+    original animation, so every existing crawl space still works exactly as
+    designed. Scale stays (1,1,1). The capsule resource is duplicate()d once
+    in _ready so the height edit cannot leak through a shared resource.
+
+  * sp_patch_crouch_animation() (called first thing in _ready): removes the
+    two tracks targeting "body" (scale + position) from "new_animation" at
+    runtime; the head/camera dip and crouchvis tracks are kept, so the crouch
+    FEEL is unchanged.
+      -> Editor-side alternative: simply delete those two tracks from the
+         animation in the editor and keep the rest of this patch; the
+         function then finds nothing to remove and becomes a no-op. That is
+         the cleaner permanent fix — the runtime surgery exists only because
+         this patch avoids touching scene files.
+
+  * sp_can_stand(): replaces the ray as the stand-up gate with a
+    direct-space intersect_shape query of a standing-sized capsule
+    (radius 0.48, height 1.9, positioned so its top is flush at y=2.0 —
+    slightly shrunk/lifted so the floor underfoot and grazing walls cannot
+    false-positive), using the player's own collision_mask and excluding the
+    player's RID. If the space state is unavailable it falls back to the old
+    ray. The crouch_check node itself is left in the scene.
+
+  * The collider now changes in the SAME frame as a passed check (and the
+    crouch input block runs after move_and_slide), which closes the 0.2 s
+    grow-after-check race from (b).
+
+  * Anti-embed watchdog (in _physics_process, every 10 physics frames): if a
+    STANDING player is penetrating geometry from above — detected via
+    PhysicsServer3D.body_test_motion with zero motion, a contact normal
+    pointing down (normal.y < -0.6) and depth > 0.08 — the player is
+    automatically crouched ("Forced to crouch.") and thereby freed. This
+    rescues every remaining path into the wedged state (doors/elevators
+    closing onto the player, and saves made while already stuck by the old
+    bug). It is gated on !crouch/!dead/!floating/!player_inactive and showed
+    zero false triggers in a 300-frame movement soak test.
+
+  * The respawn force-uncrouch is now gated on sp_can_stand(); if there is
+    no headroom the player simply stays crouched.
+
+  Compatibility notes: enemies aim using new_manager.cur_crouch — that
+  mirror is untouched. Gamemanager.crouched save semantics are unchanged.
+
+
+--------------------------------------------------------------------------
+2. FRAMERATE COLLAPSE OVER LONG SESSIONS ("memory leak")
+   (new_manager.gd + eight decal scripts)
+--------------------------------------------------------------------------
+Root cause:
+
+  * Bullet holes, casings, and hit-blood are spawned with
+    get_tree().get_root().add_child(...) (~200 sites in player.gd), so they
+    live ABOVE the current scene and survive level transitions, death, and
+    quitting to the menu — change_scene_to_file() only swaps current_scene.
+
+  * The decal-lifetime option's "OFF" value (decal_lifetime >= 90, the
+    default) disables every timed self-free branch (casing1.gd even stops
+    its own deletion Timer), making every decal immortal.
+
+  * deletedecals() cleans groups "bullethole" and "delete_upon_transition",
+    but blood_sprite.tscn (the per-hit blood, spawned once per pellet/hit)
+    is only in group "blood_splatter" — it was never cleaned ANYWHERE and
+    accumulated for the entire process lifetime.
+
+  After a few hours, thousands of live Node3Ds (AnimatedSprite3D +
+  AudioStreamPlayer3D each) accumulate and the frame rate collapses until a
+  full restart — consistent with the "Memory Leak?" reports on the Steam
+  forum.
+
+What the patch does:
+
+  * new_manager gains a small bounded FIFO registry:
+    register_decal(node, category) with caps SP_DECAL_CAPS =
+    {bullethole: 300, blood: 250, casing: 150} (constants — tune freely).
+    When a category exceeds its cap, the oldest entry is queue_free()d, and
+    invalid references are pruned as a side effect. The newest few hundred
+    decals — everything a player can actually see — remain.
+
+  * Each decal scene registers itself with ONE added line at the top of its
+    _ready. Registration lives in the decal scripts, so none of the ~200
+    spawn sites needed changing and enemy-spawned decals are covered too.
+    Registered: bullethole2.gd (also used by bullethole3.tscn),
+    bullethole5.gd (also used by bullethole6.tscn), bullethole7.gd,
+    bullethole_melee.gd, sword_bullethole.gd, blood_splatter.gd,
+    blood_sprite.gd, random/casing1.gd.
+    (bullethole4.gd and explosive_bullethole.gd already free themselves on
+    their own timers and were deliberately left out.)
+
+  * deletedecals() additionally frees group "blood_splatter" — this is the
+    actual fix for the never-cleaned hit-blood — and sweeps the registry.
+
+  * The options menu is untouched: "OFF" still means "no timed fade"; it is
+    now bounded by the caps instead of leaking without limit. Values below
+    90 behave exactly as before.
+
+
+--------------------------------------------------------------------------
+3. LOW-SANITY ELEVATOR RIDE CAN SOFT-LOCK   (Maps/main_scene.gd)
+--------------------------------------------------------------------------
+  _crazy_elevator_ride() rolls the destination with
+  randi_range(0.6, 5.4). randi_range takes ints, so GDScript truncates this
+  to randi_range(0, 5) — and a result of 0 matches none of the == 1..5
+  branches. Everything, including freeing the old map, spawning the new one,
+  and REOPENING THE DOORS, lives inside those branches, so on a 0 the
+  elevator closes and nothing else happens: a ~1-in-6 soft-lock whenever the
+  crazy ride triggers (mental health <= 40). Changed to randi_range(1, 5).
+
+
+--------------------------------------------------------------------------
+4. SMALL FIXES
+--------------------------------------------------------------------------
+  * Maps/main_scene.gd: map teardown during elevator transitions used
+    i.free() (immediate deletion) on the live map from inside an await
+    chain. Replaced with queue_free() — the code then waits 2 s before
+    instancing the next map, so behavior is identical, without the risk of
+    freeing nodes that are still mid-callback that frame.
+
+  * bullethole4.gd: "$AnimatedSprite3D.speed_scale == randf_range(0.8, 1.2)"
+    used == (a comparison whose result is discarded) instead of =, so the
+    dragonbreath flicker variance never applied. (bullethole2.gd already has
+    the correct = version of this line.)
+
+
+--------------------------------------------------------------------------
+HOW THIS WAS TESTED
+--------------------------------------------------------------------------
+  A headless Godot 4.2.2 test harness mounts the shipped pck, instantiates
+  the real player.tscn over synthetic collision geometry — including the
+  exact partial-edge-overhang setup from bug 1a that the old ray check
+  misses — drives crouch/movement through the input system, and asserts 55
+  checks: crouch/uncrouch toggling, denial under full and edge overhangs, no
+  embedding, watchdog rescue of a deliberately embedded standing player
+  within 25 physics frames, zero watchdog false-positives across a 300-frame
+  movement soak, the decal caps (500 spawned bulletholes settle at 300), and
+  the deletedecals()/blood cleanup paths. All 55 pass with this patch; the
+  edge-overhang and cap tests fail on the unpatched scripts, as expected.
+  The harness needs no changes to the project and is available on request.
+
+--- unified diff follows ---
+diff --git a/Maps/main_scene.gd b/Maps/main_scene.gd
+index 6cc32e6..21a3c74 100644
+--- a/Maps/main_scene.gd
++++ b/Maps/main_scene.gd
+@@ -99,7 +99,7 @@ func _normal_elevator_ride():
+ 			$sound_motor.play()
+ 			new_manager.deletedecals()
+ 			for i in $spawner_maps.get_children():
+-				i.free()
++				i.queue_free()
+ 			for body in $delete_picked_up_items.get_overlapping_bodies():
+ 				if body.is_in_group("item"):
+ 					body.queue_free()
+@@ -125,7 +125,7 @@ func _normal_elevator_ride():
+ 			$sound_motor.play()
+ 			new_manager.deletedecals()
+ 			for i in $spawner_maps.get_children():
+-				i.free()
++				i.queue_free()
+ 			for body in $delete_picked_up_items.get_overlapping_bodies():
+ 				if body.is_in_group("item"):
+ 					body.queue_free()
+@@ -151,7 +151,7 @@ func _normal_elevator_ride():
+ 			$sound_motor.play()
+ 			new_manager.deletedecals()
+ 			for i in $spawner_maps.get_children():
+-				i.free()
++				i.queue_free()
+ 			for body in $delete_picked_up_items.get_overlapping_bodies():
+ 				if body.is_in_group("item"):
+ 					body.queue_free()
+@@ -177,7 +177,7 @@ func _normal_elevator_ride():
+ 			$sound_motor.play()
+ 			new_manager.deletedecals()
+ 			for i in $spawner_maps.get_children():
+-				i.free()
++				i.queue_free()
+ 			for body in $delete_picked_up_items.get_overlapping_bodies():
+ 				if body.is_in_group("item"):
+ 					body.queue_free()
+@@ -196,7 +196,7 @@ func _normal_elevator_ride():
+ 
+ func _crazy_elevator_ride():
+ 	randomize()
+-	var random_map = randi_range(0.6, 5.4)
++	var random_map = randi_range(1, 5)
+ 	new_manager.elevator_level = 0
+ 	new_manager.teleport_z = -1100
+ 	if random_map == 1:
+@@ -206,7 +206,7 @@ func _crazy_elevator_ride():
+ 		$sound_motor.play()
+ 		new_manager.deletedecals()
+ 		for i in $spawner_maps.get_children():
+-			i.free()
++			i.queue_free()
+ 		for body in $delete_picked_up_items.get_overlapping_bodies():
+ 			if body.is_in_group("item"):
+ 				body.queue_free()
+@@ -229,7 +229,7 @@ func _crazy_elevator_ride():
+ 		$sound_motor.play()
+ 		new_manager.deletedecals()
+ 		for i in $spawner_maps.get_children():
+-			i.free()
++			i.queue_free()
+ 		for body in $delete_picked_up_items.get_overlapping_bodies():
+ 			if body.is_in_group("item"):
+ 				body.queue_free()
+@@ -252,7 +252,7 @@ func _crazy_elevator_ride():
+ 		$sound_motor.play()
+ 		new_manager.deletedecals()
+ 		for i in $spawner_maps.get_children():
+-			i.free()
++			i.queue_free()
+ 		for body in $delete_picked_up_items.get_overlapping_bodies():
+ 			if body.is_in_group("item"):
+ 				body.queue_free()
+@@ -275,7 +275,7 @@ func _crazy_elevator_ride():
+ 		$sound_motor.play()
+ 		new_manager.deletedecals()
+ 		for i in $spawner_maps.get_children():
+-			i.free()
++			i.queue_free()
+ 		for body in $delete_picked_up_items.get_overlapping_bodies():
+ 			if body.is_in_group("item"):
+ 				body.queue_free()
+@@ -298,7 +298,7 @@ func _crazy_elevator_ride():
+ 		$sound_motor.play()
+ 		new_manager.deletedecals()
+ 		for i in $spawner_maps.get_children():
+-			i.free()
++			i.queue_free()
+ 		for body in $delete_picked_up_items.get_overlapping_bodies():
+ 			if body.is_in_group("item"):
+ 				body.queue_free()
+diff --git a/blood_splatter.gd b/blood_splatter.gd
+index ca3f683..f362da9 100644
+--- a/blood_splatter.gd
++++ b/blood_splatter.gd
+@@ -1,6 +1,7 @@
+ extends Node3D
+ 
+ func _ready():
++	new_manager.register_decal(self, "blood")
+ 	if new_manager.decal_lifetime < 90:
+ 		await get_tree().create_timer(new_manager.decal_lifetime).timeout
+ 		queue_free()
+diff --git a/blood_sprite.gd b/blood_sprite.gd
+index b501f58..0b4774e 100644
+--- a/blood_sprite.gd
++++ b/blood_sprite.gd
+@@ -3,6 +3,7 @@ extends Node3D
+ @onready var splat = preload("res://blood_splatter.tscn")
+ 
+ func _ready():
++	new_manager.register_decal(self, "blood")
+ 	$AnimatedSprite3D.play()
+ 	await get_tree().create_timer(0.05).timeout
+ 	if new_manager.decal_lifetime < 90:
+diff --git a/bullethole2.gd b/bullethole2.gd
+index f4e9dfd..0c805c0 100644
+--- a/bullethole2.gd
++++ b/bullethole2.gd
+@@ -1,6 +1,7 @@
+ extends Node3D
+ 
+ func _ready():
++	new_manager.register_decal(self, "bullethole")
+ 	randomize()
+ 	if is_in_group("dragonbreath"):
+ 		$AnimatedSprite3D.speed_scale = randf_range(0.8, 1.2)
+diff --git a/bullethole4.gd b/bullethole4.gd
+index 57e51c7..18aa323 100644
+--- a/bullethole4.gd
++++ b/bullethole4.gd
+@@ -5,7 +5,7 @@ func _ready():
+ 	$Timer.wait_time = randf_range(4, 13)
+ 	$Timer2.wait_time = randf_range(17, 23)
+ 	if is_in_group("dragonbreath"):
+-		$AnimatedSprite3D.speed_scale == randf_range(0.8, 1.2)
++		$AnimatedSprite3D.speed_scale = randf_range(0.8, 1.2)
+ 	$sparks/miss.pitch_scale = randf_range(0.75, 1.25)
+ 	$sparks/GPUParticles3D.emitting = true
+ 	await get_tree().create_timer(0.42).timeout
+diff --git a/bullethole5.gd b/bullethole5.gd
+index ff4f422..fd2b919 100644
+--- a/bullethole5.gd
++++ b/bullethole5.gd
+@@ -1,6 +1,7 @@
+ extends Node3D
+ 
+ func _ready():
++	new_manager.register_decal(self, "bullethole")
+ 	if new_manager.decal_lifetime < 90:
+ 		await get_tree().create_timer(new_manager.decal_lifetime).timeout
+ 		queue_free()
+diff --git a/bullethole7.gd b/bullethole7.gd
+index eb8ad96..7817d62 100644
+--- a/bullethole7.gd
++++ b/bullethole7.gd
+@@ -4,6 +4,7 @@ extends Node3D
+ 
+ # Called when the node enters the scene tree for the first time.
+ func _ready():
++	new_manager.register_decal(self, "bullethole")
+ 	if Engine.time_scale != 1:
+ 		if Engine.time_scale != 0.01:
+ 			Engine.time_scale = 1
+diff --git a/bullethole_melee.gd b/bullethole_melee.gd
+index 147945a..a74622f 100644
+--- a/bullethole_melee.gd
++++ b/bullethole_melee.gd
+@@ -3,6 +3,7 @@ extends Node3D
+ var fist = false
+ 
+ func _ready():
++	new_manager.register_decal(self, "bullethole")
+ 	if fist == true:
+ 		$Sprite3D.hide()
+ 		$Sprite3D2.show()
+diff --git a/new_manager.gd b/new_manager.gd
+index 2231577..38b3e4c 100644
+--- a/new_manager.gd
++++ b/new_manager.gd
+@@ -157,6 +157,13 @@ func deletedecals() -> void:
+ 		decal.queue_free()
+ 	for decal2 in get_tree().get_nodes_in_group("delete_upon_transition"):
+ 		decal2.queue_free()
++	for decal3 in get_tree().get_nodes_in_group("blood_splatter"):
++		decal3.queue_free()
++	for key in sp_decals:
++		for d in sp_decals[key]:
++			if is_instance_valid(d):
++				d.queue_free()
++		sp_decals[key].clear()
+ 
+ func deletekazhanovnotes() -> void:
+ 	for decal in get_tree().get_nodes_in_group("kazhanov"):
+@@ -169,3 +176,24 @@ func deletefakeball() -> void:
+ func clean_dialog_end():
+ 	await get_tree().create_timer(0.1).timeout
+ 	PongManager.player_inactive = false
++
++# ---- SONAR PATCH: bounded decal registry ----
++# Decals/casings/blood are parented to the tree root and, with the "OFF" decal
++# lifetime (>= 90), never freed themselves. Each decal registers here from its
++# _ready; beyond the per-category cap the oldest one is freed, which bounds the
++# session-long node growth that degraded performance over time.
++const SP_DECAL_CAPS = {"bullethole": 300, "blood": 250, "casing": 150}
++var sp_decals = {"bullethole": [], "blood": [], "casing": []}
++
++func register_decal(node: Node, category: String) -> void:
++	if not sp_decals.has(category):
++		category = "bullethole"
++	var arr: Array = sp_decals[category]
++	arr.append(node)
++	for i in range(arr.size() - 1, -1, -1):
++		if not is_instance_valid(arr[i]):
++			arr.remove_at(i)
++	while arr.size() > SP_DECAL_CAPS[category]:
++		var oldest = arr.pop_front()
++		if is_instance_valid(oldest):
++			oldest.queue_free()
+diff --git a/player.gd b/player.gd
+index dbdfc88..972a2e6 100644
+--- a/player.gd
++++ b/player.gd
+@@ -142,6 +142,7 @@ var time := 0.0
+ @onready var initial_rotation := $head/Camera3D.rotation_degrees as Vector3
+ 
+ func _ready():
++	sp_patch_crouch_animation()
+ 	new_manager.player_dead = true
+ 	AudioServer.set_bus_volume_db(
+ 		AudioServer.get_bus_index("Master"),
+@@ -344,6 +345,7 @@ func _ready():
+ 		$crouch.play("new_animation")
+ 		SPEED = 3
+ 		$health/body.animation = "crouch"
++		sp_apply_crouch_shape(true)
+ 	if Gamemanager.fps == true:
+ 		$fps.show()
+ 		if Gamemanager.vsync == false:
+@@ -994,11 +996,12 @@ func _process(delta):
+ 				$death_handler/death_player.play_backwards("death")
+ 				$death_handler/flash.hide()
+ 				await get_tree().create_timer(1).timeout
+-				if crouch == true:
++				if crouch == true and sp_can_stand():
+ 					crouch = false
+ 					$health/body.animation = "default"
+ 					SPEED = 5
+ 					$crouch.play_backwards("new_animation")
++					sp_apply_crouch_shape(false)
+ 				$health/brain.show()
+ 				$health/skull.hide()
+ 				$blood_pool.hide()
+@@ -3668,6 +3671,16 @@ func _physics_process(delta):
+ 	else:
+ 		velocity.x = move_toward(velocity.x, 0, SPEED * Gamemanager.speed * modifier_item)
+ 		velocity.z = move_toward(velocity.z, 0, SPEED * Gamemanager.speed * modifier_item)
++	# SONAR PATCH: anti-embed watchdog — rescues a player wedged into geometry from above
++	# (uncrouch races, closing doors, elevators, legacy stuck saves).
++	sp_embed_frame_counter += 1
++	if sp_embed_frame_counter >= 10:
++		sp_embed_frame_counter = 0
++		if crouch == false and dead == false and floating == false and PongManager.player_inactive == false:
++			if sp_is_embedded_from_above():
++				sp_force_crouch()
++				$info3.text = "Forced to crouch."
++				$info_num.text = " "
+ 	if PongManager.player_inactive == false:
+ 		if dead == false and stunned == false:
+ 			move_and_slide()
+@@ -3973,8 +3986,9 @@ func _physics_process(delta):
+ 		crouch = true
+ 		SPEED = 3
+ 		$health/body.animation = "crouch"
++		sp_apply_crouch_shape(true)
+ 	if Input.is_action_just_pressed("crouch") and trigger == false and crouch == true and dead == false:
+-		if $crouch_check.is_colliding():
++		if not sp_can_stand():
+ 			$info3.text = "Can't stand here."
+ 			$info_num.text = " "
+ 		else:
+@@ -3983,6 +3997,7 @@ func _physics_process(delta):
+ 			$health/body.animation = "default"
+ 			SPEED = 5
+ 			$crouch.play_backwards("new_animation")
++			sp_apply_crouch_shape(false)
+ 
+ 	if Input.is_action_just_pressed("shoot") and Gamemanager.cur_wep_is_main_eqip == false and Gamemanager.clip_2 < 1 and menu_hover == false and PongManager.player_inactive == false:
+ 		if Gamemanager.current_weapon_sidearm < 31:
+@@ -15759,3 +15774,73 @@ func _on_puppet_spawner_timer_timeout():
+ 			$puppet_spawner_timer.wait_time = randi_range(35, 190)
+ 		else:
+ 			$puppet_timer.start()
++
++# ---- SONAR PATCH: crouch collision fixes ----
++# The shipped game shrank the capsule by animating a non-uniform scale on the
++# "body" CollisionShape3D (unsupported by Godot physics) and gated standing up
++# on a single center ray, so standing under a partial overhang embedded the
++# player in geometry. The collider is now resized in code, standing clearance
++# uses a full capsule query, and a watchdog un-wedges an embedded player.
++
++var sp_embed_frame_counter = 0
++
++func sp_apply_crouch_shape(is_crouched: bool) -> void:
++	var cs = get_node_or_null("body")
++	if cs == null or not (cs.shape is CapsuleShape3D):
++		return
++	cs.scale = Vector3.ONE
++	if is_crouched:
++		cs.shape.height = 1.0
++		cs.position.y = 0.5118
++	else:
++		cs.shape.height = 2.0
++		cs.position.y = 1.0
++
++func sp_patch_crouch_animation() -> void:
++	var cs = get_node_or_null("body")
++	if cs != null and cs.shape != null:
++		cs.shape = cs.shape.duplicate()
++	var ap = get_node_or_null("crouch")
++	if ap == null:
++		return
++	var anim: Animation = ap.get_animation("new_animation")
++	if anim == null:
++		return
++	for t in range(anim.get_track_count() - 1, -1, -1):
++		var p: NodePath = anim.track_get_path(t)
++		if p.get_name_count() > 0 and String(p.get_name(p.get_name_count() - 1)) == "body":
++			anim.remove_track(t)
++
++func sp_can_stand() -> bool:
++	var w = get_world_3d()
++	if w == null or w.direct_space_state == null:
++		return not $crouch_check.is_colliding()
++	var shape = CapsuleShape3D.new()
++	shape.radius = 0.48
++	shape.height = 1.9
++	var params = PhysicsShapeQueryParameters3D.new()
++	params.shape = shape
++	params.transform = global_transform * Transform3D(Basis(), Vector3(0, 2.0 - shape.height * 0.5, 0))
++	params.collision_mask = collision_mask
++	params.exclude = [get_rid()]
++	return w.direct_space_state.intersect_shape(params, 1).is_empty()
++
++func sp_is_embedded_from_above() -> bool:
++	var params = PhysicsTestMotionParameters3D.new()
++	params.from = global_transform
++	params.motion = Vector3.ZERO
++	params.recovery_as_collision = true
++	var result = PhysicsTestMotionResult3D.new()
++	if not PhysicsServer3D.body_test_motion(get_rid(), params, result):
++		return false
++	for i in range(result.get_collision_count()):
++		if result.get_collision_normal(i).y < -0.6 and result.get_collision_depth(i) > 0.08:
++			return true
++	return false
++
++func sp_force_crouch() -> void:
++	crouch = true
++	SPEED = 3
++	$health/body.animation = "crouch"
++	$crouch.play("new_animation")
++	sp_apply_crouch_shape(true)
+diff --git a/random/casing1.gd b/random/casing1.gd
+index b4a392e..6c71095 100644
+--- a/random/casing1.gd
++++ b/random/casing1.gd
+@@ -2,6 +2,7 @@ extends Node3D
+ var type = 1
+ 
+ func _ready():
++	new_manager.register_decal(self, "casing")
+ 	if type == 1:
+ 		$Sprite3D.show()
+ 	if type == 2:
+diff --git a/sword_bullethole.gd b/sword_bullethole.gd
+index d3ce117..1a65ad0 100644
+--- a/sword_bullethole.gd
++++ b/sword_bullethole.gd
+@@ -3,6 +3,7 @@ extends Node3D
+ 
+ # Called when the node enters the scene tree for the first time.
+ func _ready():
++	new_manager.register_decal(self, "bullethole")
+ 	randomize()
+ 	var rndom_num = randf_range(0, 5)
+ 	rndom_num = int(rndom_num)
