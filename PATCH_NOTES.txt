@@ -1,5 +1,5 @@
-SONAR SHOCK — COMMUNITY BUGFIX PATCH
-=====================================
+SONAR SHOCK — COMMUNITY BUGFIX PATCH (v1.2)
+============================================
 Applied to: Sonar Shock.pck (Godot 4.2.2). The original file is preserved
 unmodified as "Sonar Shock.pck.orig" — restore it by deleting the patched
 "Sonar Shock.pck" and renaming the .orig back. The exe, Steam DLLs, and your
@@ -39,14 +39,69 @@ WHAT WAS FIXED
      destination, so the elevator closed its doors and did nothing. The roll
      is now a proper 1..5.
 
-4. Smaller fixes
+4. Stuck holding a barrel — "Not enough space." (new in v1.1)
+   - Putting down a carried item was gated by a fixed test cube in front of
+     the player that bore no relation to the item's size: while crouched its
+     bottom sank below the floor, so the floor itself denied EVERY placement,
+     and any wall, step, or nearby prop (e.g. the barrel clusters on floor 3)
+     blocked it too. Barrels and soma mines couldn't be thrown away either
+     (their throw repeated the same broken check), and weapons stay disabled
+     while carrying — a soft-lock in tight rooms.
+   - Placement is now checked with a volume shaped like the actual carried
+     item, sitting where the item actually lands, ignoring flat floors and
+     the player's own body. Throwing a barrel/mine now only requires open
+     space directly ahead (like every other item), so you can always throw
+     your way out. Dropping face-first into a wall is still denied, and the
+     denial sound no longer machine-guns while the button is held.
+
+5. Stuttering, worst on floor 3 (new in v1.2)
+   - The floor-3 security-monitor screen plays a "video" made of 1,314
+     separate image files at 45 fps, on a loop, from the moment you enter
+     the floor — even through walls. It is by far the heaviest animation in
+     the game (the runner-up is 31 frames) and caused recurring hitches all
+     over the floor. It now pauses automatically whenever it is off screen
+     and plays normally when you actually look at it.
+   - Every enemy that had reached you made the engine print an internal
+     error to the console EVERY physics frame (a failed "look_at" with a
+     degenerate direction) — console writes mid-frame are a classic stutter
+     source on Windows, and this fired exactly during melee combat. All 13
+     such call sites across 11 enemy scripts are now guarded. Blood
+     splatter landing on floors/ceilings triggered one more such error per
+     hit; its decal aiming was fixed too (this also corrects subtly wrong
+     splatter orientation on sloped surfaces).
+   - The player's position was pushed to every living enemy's navigation
+     agent 60x per second, forcing full path recomputation on every sample;
+     it is now pushed ~7x per second (enemies read it on their own timers
+     anyway — combat behavior is unchanged, pathfinding just stops thrashing).
+   - Crossing into the floor-3 crypt/cyber area toggles lightmaps and fog,
+     which can hitch at the doorway while shaders compile; those shader
+     variants are now pre-warmed during the elevator ride onto the floor.
+   - A low-sanity jumpscare printed two debug lines to the console
+     mid-game; removed.
+
+6. Smaller fixes
    - Level unloading now uses deferred deletion (queue_free) instead of
      freeing live maps mid-frame (crash risk).
    - bullethole4.gd had "speed_scale == randf_range(...)" (a comparison doing
      nothing) instead of an assignment — dragonbreath decal flicker variance
      restored.
 
-FILES CHANGED INSIDE THE PCK (12 scripts, all plain GDScript)
-  player.gd, new_manager.gd, Maps/main_scene.gd, bullethole2.gd,
-  bullethole4.gd, bullethole5.gd, bullethole7.gd, bullethole_melee.gd,
-  sword_bullethole.gd, blood_splatter.gd, blood_sprite.gd, random/casing1.gd
+FILES CHANGED INSIDE THE PCK (25 scripts, all plain GDScript)
+  player.gd, new_manager.gd, Maps/main_scene.gd, Maps/Map3.gd,
+  bullethole2.gd, bullethole4.gd, bullethole5.gd, bullethole7.gd,
+  bullethole_melee.gd, sword_bullethole.gd, blood_splatter.gd,
+  blood_sprite.gd, random/casing1.gd, steam_jumpscare.gd, and 11 enemy
+  scripts (diver, rusalka, leshy, fishmonger, tank, deer_mut1, kgb x3,
+  gasmask x2)
+
+HOW IT WAS VERIFIED
+  A headless Godot 4.2.2 test harness mounts this exact pck, instantiates the
+  real player scene over synthetic test geometry (including the exact
+  edge-overhang case that triggered the stuck bug), simulates crouch input,
+  and asserts 93 checks covering the crouch fix, the anti-stuck watchdog, the
+  decal cap, the cleanup paths, item placement (standing and crouched
+  drops, wall/blocked-volume denials, and the throw escape), and the
+  stutter fixes (a live enemy ticking on a degenerate nav target with the
+  test runner failing if a single look_at error reaches the console) — all
+  passing. The decompiled sources,
+  tools, and test suite are in the "work/" folder (git repository).

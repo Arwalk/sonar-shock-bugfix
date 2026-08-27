@@ -1,6 +1,8 @@
 SONAR SHOCK — COMMUNITY BUGFIX PATCH v1.0
 ==========================================
 An unofficial fan patch for Sonar Shock (Steam, Godot 4.2.2 build).
+It becomes obsolete the moment the developer ships these fixes officially —
+the same fixes have been sent upstream as SonarShock_bugfixes.patch.
 
 WHAT IT FIXES
 -------------
@@ -52,7 +54,8 @@ SAFETY, FOR THE CAUTIOUS
      original  Sonar Shock.pck : 98332c90d863c6ecf975cc29342608ef2a8732787de9f10fbc459cdd1ead7e01
      patched   Sonar Shock.pck : 9f03f18b2aae68e873c8b0d77778834b6c6dd7088f315961126270d81fd7c11e
  * SonarShock_bugfixes.patch is the complete, human-readable list of code
-   changes. PATCH_NOTES.txt has a plain-language summary.
+   changes (the same document sent to the developer). PATCH_NOTES.txt has a
+   plain-language summary.
 
 FILES IN THIS PACKAGE
 ---------------------

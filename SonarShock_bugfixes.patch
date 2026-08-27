@@ -1,11 +1,12 @@
 SONAR SHOCK — COMMUNITY BUGFIX PATCH (for upstream)
 ====================================================
-From a player, with respect — the game is great; these are fixes for the two
+From a player, with respect — the game is great; these are fixes for the
 bugs that hurt the most in long sessions (getting permanently stuck after
-crouching, and the framerate collapsing over time), plus a few small ones
-found along the way.
+crouching, the framerate collapsing over time, getting stuck holding a
+barrel that the game refuses to put down, and stuttering — worst on
+floor 3), plus a few small ones found along the way.
 
-Scope: 12 GDScript files, 134 insertions / 13 deletions. No scenes, resources,
+Scope: 25 GDScript files, 270 insertions / 80 deletions. No scenes, resources,
 project settings, or save formats are touched. All added helpers/vars are
 prefixed sp_ to avoid collisions. The diff was taken against the scripts of
 the 4.2.2 Steam build (they ship as plain text in the pck), so it should apply
@@ -161,7 +162,128 @@ What the patch does:
 
 
 --------------------------------------------------------------------------
-4. SMALL FIXES
+4. CARRIED BARREL / MINE CAN NEVER BE PUT DOWN — "Not enough space."
+   (player.gd)
+--------------------------------------------------------------------------
+Root cause — the drop check denies far too much, and two items have no
+throw escape:
+
+  * Dropping a carried item is gated by spawner/Area3D under the camera —
+    a fixed 0.65 m cube ~1.25 m ahead at mid-height. ANY overlapping body
+    denies with "Not enough space.": no filtering, and no relation to the
+    carried item's actual size.
+
+  * Crouching lowers the head by 0.5, which sinks the bottom of that cube
+    BELOW the floor plane — while crouched, the floor itself denies every
+    placement, without exception.
+
+  * The volume cannot be aimed (items always spawn at the fixed point), so
+    any wall, step, or neighbouring prop inside the cube also denies — e.g.
+    barrels on Map3 stand 1.07 m apart, closer than the cube is wide.
+
+  * Crates, fire extinguishers and flares can always be THROWN as an
+    escape, but the barrel and soma-mine throws repeat the same overlap
+    check. A blocked volume therefore means the barrel can never leave the
+    player's hands — and while carrying, every weapon is disabled: a
+    soft-lock until the player happens onto open ground.
+
+  * (The item_spawn_check forward ray was meant as a second gate but sits
+    INSIDE the overlap loop, so it only runs when the area already denied —
+    dead code.)
+
+What the patch does (player.gd only, scene untouched):
+
+  * sp_can_place(check_volume): the three copies of the check collapse into
+    one helper. It promotes the item_spawn_check ray to the (now actually
+    reachable) point-blank-wall gate, and replaces the Area3D test with a
+    direct-space intersect_shape query of a cylinder sized to the carried
+    item (barrel r 0.40 h 1.0, crate r 0.35 h 0.6, small items r 0.25
+    h 0.4), anchored just ABOVE the spawn point to match how the props
+    actually occupy space — so flat floors can no longer false-positive,
+    crouched or not. The player's own RID is excluded.
+
+  * Drops (interact) check ray + volume. The barrel and soma-mine throws
+    now check only the ray, exactly like every other item's throw always
+    did — turning toward any open direction works, so the carry state can
+    no longer soft-lock, while the ray still prevents throwing an item
+    into or beyond a point-blank wall.
+
+  * The denial sound no longer restarts every physics frame while the
+    throw button is held.
+
+  Compatibility notes: the Area3D and item_spawn_check nodes stay in the
+  scene (the area is simply no longer consulted; the helper falls back to
+  it if the physics space is unavailable). A genuine point-blank wall
+  still denies, so the game feel is unchanged.
+
+
+--------------------------------------------------------------------------
+5. STUTTERING / HITCHES, WORST ON FLOOR 3
+   (Maps/Map3.gd, Maps/main_scene.gd, blood_sprite.gd, steam_jumpscare.gd,
+    11 enemy scripts)
+--------------------------------------------------------------------------
+Several independent causes; each fix is small and self-contained.
+
+  a) The Map3 security-monitor "video".  The screen on
+     objects/Camera2 plays a SpriteFrames animation of 1,314 separate
+     192x108 textures (~32 MB) at 45 fps, loop + autoplay, with no
+     visibility culling — it swaps to a different GPU texture every ~22 ms
+     from level entry, forever, even through walls. (For scale: the next
+     largest animation in the game is 31 frames.)  Map3.gd _ready now
+     attaches a VisibleOnScreenNotifier3D to the sprite and pauses it
+     whenever it is off screen; it plays at full rate only while actually
+     being looked at. Null-guarded, so the map loads fine even if the node
+     is renamed later.
+
+  b) Enemy look_at() error spam.  While pathing, enemies aim a helper node
+     with look_at(next_loc, Vector3.UP) every physics frame. next_loc comes
+     from NavigationAgent3D.get_next_path_position(), which returns the
+     agent's OWN position once the path is finished — i.e. exactly when the
+     enemy reaches the player. The direction then degenerates (equal or
+     vertically-aligned with UP) and Godot prints an engine error EVERY
+     PHYSICS FRAME PER ADJACENT ENEMY. Synchronous console/stderr writes on
+     the main thread are a classic Windows stutter source, and this fires
+     precisely during melee combat. All 13 such call sites (11 enemy
+     scripts) now skip the call when the target's horizontal offset from
+     the aiming node is negligible — which is also what the failed call
+     did, minus the error.
+
+  c) Navigation fan-out.  main_scene.gd pushed the player position to every
+     living enemy via call_group() EVERY physics tick. The enemies only
+     sample their path on their own timers (that is what the "path quality"
+     option scales), but re-setting the target 60x/s dirties every
+     NavigationAgent3D so each sampled query is a full cold repath. The
+     fan-out now runs every 0.15 s; a target at most 0.15 s stale is
+     imperceptible and combat behavior is unchanged.
+
+  d) Blood decal aiming.  blood_sprite.gd aims splatter decals with
+     look_at(point - normal, Vector3.UP) and only RETRIES with
+     Vector3.RIGHT if the surface normal is exactly (0,+/-1,0) — so every
+     floor/ceiling splat first fires a failed look_at and its engine error
+     (one stderr write per splat, i.e. per pellet hit in combat). The up
+     vector is now chosen BEFORE the call. This also fixes silently wrong
+     decal orientation on near-but-not-exactly-horizontal surfaces, which
+     the exact-equality check missed.
+
+  e) Crypt threshold (floor 3).  Crossing the trigger_cyber area toggles
+     LightmapGI and fog, which can stall on first-use shader variants at
+     the doorway. Map3.gd now applies that rendering state for two frames
+     during map load (while the elevator still hides the world) so the
+     variants compile behind the loading pause instead. Best-effort: a
+     no-op if nothing renders during those frames.
+
+  f) steam_jumpscare.gd printed two debug lines mid-game on the main
+     thread when fetching the Steam avatar for the low-sanity jumpscare;
+     removed.
+
+  Not addressed here (noted for completeness): the floor-3 entry load spike
+  also caused by (a) — the 1,314 textures are hard dependencies of
+  Map3.tscn and would need the scene itself re-authored (e.g. as a
+  spritesheet); scenes are deliberately out of scope for this patch.
+
+
+--------------------------------------------------------------------------
+6. SMALL FIXES
 --------------------------------------------------------------------------
   * Maps/main_scene.gd: map teardown during elevator transitions used
     i.free() (immediate deletion) on the live map from inside an await
@@ -181,21 +303,84 @@ HOW THIS WAS TESTED
   A headless Godot 4.2.2 test harness mounts the shipped pck, instantiates
   the real player.tscn over synthetic collision geometry — including the
   exact partial-edge-overhang setup from bug 1a that the old ray check
-  misses — drives crouch/movement through the input system, and asserts 55
+  misses — drives crouch/movement through the input system, and asserts 69
   checks: crouch/uncrouch toggling, denial under full and edge overhangs, no
   embedding, watchdog rescue of a deliberately embedded standing player
   within 25 physics frames, zero watchdog false-positives across a 300-frame
-  movement soak, the decal caps (500 spawned bulletholes settle at 300), and
-  the deletedecals()/blood cleanup paths. All 55 pass with this patch; the
-  edge-overhang and cap tests fail on the unpatched scripts, as expected.
-  The harness needs no changes to the project and is available on request.
+  movement soak, the decal caps (500 spawned bulletholes settle at 300), the
+  deletedecals()/blood cleanup paths, item placement (standing AND
+  fully-crouched barrel drops in the open, denial at a point-blank wall and
+  over a blocked spawn volume, the barrel-throw escape, and crate/mine drops
+  through the shared path), and the stutter fixes (a live enemy ticking with
+  an equal and a vertically-aligned nav target without a single look_at
+  engine error reaching stderr — the runner fails if any does — plus static
+  asserts that all 13 guards, the monitor culling, and the fan-out throttle
+  are present). All 93 pass with this patch; the edge-overhang, cap,
+  crouched-placement, and look_at-spam tests fail on the unpatched scripts,
+  as expected. The harness needs no changes to the project and is available
+  on request.
 
 --- unified diff follows ---
+diff --git a/Maps/Map3.gd b/Maps/Map3.gd
+index a08cf2a..92353c5 100644
+--- a/Maps/Map3.gd
++++ b/Maps/Map3.gd
+@@ -53,6 +53,30 @@ func _ready():
+ 	if new_manager.quest3_1 == 0:
+ 		$NavigationRegion3D/map3_geo/layer_1_open.position.y = - 1000
+ 
++	# ---- SONAR PATCH: floor-3 stutter fixes ----
++	# The security-monitor screen (objects/Camera2) autoplays a 1314-frame
++	# SpriteFrames "video" at 45 fps with no culling, swapping GPU textures
++	# every ~22 ms forever. Pause it whenever it is not on screen.
++	var cam_screen = get_node_or_null("NavigationRegion3D/objects/Camera2/AnimatedSprite3D")
++	if cam_screen != null:
++		var vis_check = VisibleOnScreenNotifier3D.new()
++		vis_check.aabb = AABB(Vector3(-0.6, -0.6, -0.6), Vector3(1.2, 1.2, 1.2))
++		vis_check.screen_entered.connect(cam_screen.play)
++		vis_check.screen_exited.connect(cam_screen.pause)
++		cam_screen.add_child(vis_check)
++		cam_screen.pause()
++
++	# Best-effort prewarm of the crypt/cyber threshold rendering state
++	# (trigger_cyber toggles LightmapGI + fog, which can stall on first-use
++	# shader variants). Applied for two frames while the elevator still hides
++	# the world; harmless no-op if nothing renders during load.
++	$WorldEnvironment.environment.fog_enabled = false
++	$LightmapGI.hide()
++	await get_tree().process_frame
++	await get_tree().process_frame
++	$LightmapGI.show()
++	$WorldEnvironment.environment.fog_enabled = true
++
+ func _physics_process(_delta):
+ 	if new_manager.beserk_active == true:
+ 		if beserk_trigger == false:
 diff --git a/Maps/main_scene.gd b/Maps/main_scene.gd
-index 6cc32e6..21a3c74 100644
+index 6cc32e6..1a0b1b9 100644
 --- a/Maps/main_scene.gd
 +++ b/Maps/main_scene.gd
-@@ -99,7 +99,7 @@ func _normal_elevator_ride():
+@@ -70,7 +70,18 @@ func _process(_delta):
+ 		trigger2 = true
+ 		$captain.position.x = -112.91
+ 
+-func _physics_process(_delta):
++# ---- SONAR PATCH: throttle nav-target fan-out ----
++# Pushing the player position to every enemy every physics tick dirties each
++# NavigationAgent3D 60x/s, so every timer-gated get_next_path_position() is a
++# cold repath. Enemies only sample the path on their own timer_nextpos timers,
++# so a <=0.15 s stale target is imperceptible.
++var nav_target_cooldown = 0.0
++
++func _physics_process(delta):
++	nav_target_cooldown -= delta
++	if nav_target_cooldown > 0.0:
++		return
++	nav_target_cooldown = 0.15
+ 	get_tree().call_group("enemy", "update_target_location", player.global_transform.origin)
+ 	get_tree().call_group("omon", "update_target_location", player.global_transform.origin)
+ 
+@@ -99,7 +110,7 @@ func _normal_elevator_ride():
  			$sound_motor.play()
  			new_manager.deletedecals()
  			for i in $spawner_maps.get_children():
@@ -204,7 +389,7 @@ index 6cc32e6..21a3c74 100644
  			for body in $delete_picked_up_items.get_overlapping_bodies():
  				if body.is_in_group("item"):
  					body.queue_free()
-@@ -125,7 +125,7 @@ func _normal_elevator_ride():
+@@ -125,7 +136,7 @@ func _normal_elevator_ride():
  			$sound_motor.play()
  			new_manager.deletedecals()
  			for i in $spawner_maps.get_children():
@@ -213,7 +398,7 @@ index 6cc32e6..21a3c74 100644
  			for body in $delete_picked_up_items.get_overlapping_bodies():
  				if body.is_in_group("item"):
  					body.queue_free()
-@@ -151,7 +151,7 @@ func _normal_elevator_ride():
+@@ -151,7 +162,7 @@ func _normal_elevator_ride():
  			$sound_motor.play()
  			new_manager.deletedecals()
  			for i in $spawner_maps.get_children():
@@ -222,7 +407,7 @@ index 6cc32e6..21a3c74 100644
  			for body in $delete_picked_up_items.get_overlapping_bodies():
  				if body.is_in_group("item"):
  					body.queue_free()
-@@ -177,7 +177,7 @@ func _normal_elevator_ride():
+@@ -177,7 +188,7 @@ func _normal_elevator_ride():
  			$sound_motor.play()
  			new_manager.deletedecals()
  			for i in $spawner_maps.get_children():
@@ -231,7 +416,7 @@ index 6cc32e6..21a3c74 100644
  			for body in $delete_picked_up_items.get_overlapping_bodies():
  				if body.is_in_group("item"):
  					body.queue_free()
-@@ -196,7 +196,7 @@ func _normal_elevator_ride():
+@@ -196,7 +207,7 @@ func _normal_elevator_ride():
  
  func _crazy_elevator_ride():
  	randomize()
@@ -240,7 +425,7 @@ index 6cc32e6..21a3c74 100644
  	new_manager.elevator_level = 0
  	new_manager.teleport_z = -1100
  	if random_map == 1:
-@@ -206,7 +206,7 @@ func _crazy_elevator_ride():
+@@ -206,7 +217,7 @@ func _crazy_elevator_ride():
  		$sound_motor.play()
  		new_manager.deletedecals()
  		for i in $spawner_maps.get_children():
@@ -249,7 +434,7 @@ index 6cc32e6..21a3c74 100644
  		for body in $delete_picked_up_items.get_overlapping_bodies():
  			if body.is_in_group("item"):
  				body.queue_free()
-@@ -229,7 +229,7 @@ func _crazy_elevator_ride():
+@@ -229,7 +240,7 @@ func _crazy_elevator_ride():
  		$sound_motor.play()
  		new_manager.deletedecals()
  		for i in $spawner_maps.get_children():
@@ -258,7 +443,7 @@ index 6cc32e6..21a3c74 100644
  		for body in $delete_picked_up_items.get_overlapping_bodies():
  			if body.is_in_group("item"):
  				body.queue_free()
-@@ -252,7 +252,7 @@ func _crazy_elevator_ride():
+@@ -252,7 +263,7 @@ func _crazy_elevator_ride():
  		$sound_motor.play()
  		new_manager.deletedecals()
  		for i in $spawner_maps.get_children():
@@ -267,7 +452,7 @@ index 6cc32e6..21a3c74 100644
  		for body in $delete_picked_up_items.get_overlapping_bodies():
  			if body.is_in_group("item"):
  				body.queue_free()
-@@ -275,7 +275,7 @@ func _crazy_elevator_ride():
+@@ -275,7 +286,7 @@ func _crazy_elevator_ride():
  		$sound_motor.play()
  		new_manager.deletedecals()
  		for i in $spawner_maps.get_children():
@@ -276,7 +461,7 @@ index 6cc32e6..21a3c74 100644
  		for body in $delete_picked_up_items.get_overlapping_bodies():
  			if body.is_in_group("item"):
  				body.queue_free()
-@@ -298,7 +298,7 @@ func _crazy_elevator_ride():
+@@ -298,7 +309,7 @@ func _crazy_elevator_ride():
  		$sound_motor.play()
  		new_manager.deletedecals()
  		for i in $spawner_maps.get_children():
@@ -298,7 +483,7 @@ index ca3f683..f362da9 100644
  		await get_tree().create_timer(new_manager.decal_lifetime).timeout
  		queue_free()
 diff --git a/blood_sprite.gd b/blood_sprite.gd
-index b501f58..0b4774e 100644
+index b501f58..b9cdf0d 100644
 --- a/blood_sprite.gd
 +++ b/blood_sprite.gd
 @@ -3,6 +3,7 @@ extends Node3D
@@ -309,6 +494,55 @@ index b501f58..0b4774e 100644
  	$AnimatedSprite3D.play()
  	await get_tree().create_timer(0.05).timeout
  	if new_manager.decal_lifetime < 90:
+@@ -17,33 +18,33 @@ func _ready():
+ 				decal.global_transform.origin = $splat_cast.get_collision_point()
+ 				decal.rotation_degrees = Vector3(0, 0, 0)
+ 				get_tree().get_root().add_child(decal)
+-				decal.look_at($splat_cast.get_collision_point() - $splat_cast.get_collision_normal(), Vector3.UP)
+-				if $splat_cast.get_collision_normal() == Vector3(0, 1, 0):
+-					decal.look_at($splat_cast.get_collision_point() - $splat_cast.get_collision_normal(), Vector3.RIGHT)
+-				if $splat_cast.get_collision_normal() == Vector3(0, -1, 0):
+-					decal.look_at($splat_cast.get_collision_point() - $splat_cast.get_collision_normal(), Vector3.RIGHT)
++				# SONAR PATCH: pick the up vector before aiming — the unconditional
++				# Vector3.UP call spammed an engine error for every floor/ceiling splat
++				var sp_n1 = $splat_cast.get_collision_normal()
++				var sp_up1 = Vector3.RIGHT if absf(sp_n1.y) > 0.9999 else Vector3.UP
++				decal.look_at($splat_cast.get_collision_point() - sp_n1, sp_up1)
+ 		if $splat_cast2.is_colliding():
+ 			if !$splat_cast2.get_collider().is_in_group("shootable") and !$splat_cast2.get_collider().is_in_group("nodecals"):
+ 				var decal2 = splat.instantiate()
+ 				decal2.global_transform.origin = $splat_cast2.get_collision_point()
+ 				decal2.rotation_degrees = Vector3(0, 0, 0)
+ 				get_tree().get_root().add_child(decal2)
+-				decal2.look_at($splat_cast2.get_collision_point() - $splat_cast2.get_collision_normal(), Vector3.UP)
+-				if $splat_cast2.get_collision_normal() == Vector3(0, 1, 0):
+-					decal2.look_at($splat_cast2.get_collision_point() - $splat_cast2.get_collision_normal(), Vector3.RIGHT)
+-				if $splat_cast2.get_collision_normal() == Vector3(0, -1, 0):
+-					decal2.look_at($splat_cast2.get_collision_point() - $splat_cast2.get_collision_normal(), Vector3.RIGHT)
++				# SONAR PATCH: pick the up vector before aiming — the unconditional
++				# Vector3.UP call spammed an engine error for every floor/ceiling splat
++				var sp_n2 = $splat_cast2.get_collision_normal()
++				var sp_up2 = Vector3.RIGHT if absf(sp_n2.y) > 0.9999 else Vector3.UP
++				decal2.look_at($splat_cast2.get_collision_point() - sp_n2, sp_up2)
+ 		if $splat_cast3.is_colliding():
+ 			if !$splat_cast3.get_collider().is_in_group("shootable") and !$splat_cast3.get_collider().is_in_group("nodecals"):
+ 				var decal3 = splat.instantiate()
+ 				decal3.global_transform.origin = $splat_cast3.get_collision_point()
+ 				decal3.rotation_degrees = Vector3(0, 0, 0)
+ 				get_tree().get_root().add_child(decal3)
+-				decal3.look_at($splat_cast3.get_collision_point() - $splat_cast3.get_collision_normal(), Vector3.UP)
+-				if $splat_cast3.get_collision_normal() == Vector3(0, 1, 0):
+-					decal3.look_at($splat_cast3.get_collision_point() - $splat_cast3.get_collision_normal(), Vector3.RIGHT)
+-				if $splat_cast3.get_collision_normal() == Vector3(0, -1, 0):
+-					decal3.look_at($splat_cast3.get_collision_point() - $splat_cast3.get_collision_normal(), Vector3.RIGHT)
++				# SONAR PATCH: pick the up vector before aiming — the unconditional
++				# Vector3.UP call spammed an engine error for every floor/ceiling splat
++				var sp_n3 = $splat_cast3.get_collision_normal()
++				var sp_up3 = Vector3.RIGHT if absf(sp_n3.y) > 0.9999 else Vector3.UP
++				decal3.look_at($splat_cast3.get_collision_point() - sp_n3, sp_up3)
+ 	else:
+ 		await get_tree().create_timer(randf_range(0.5, 0.9)).timeout
+ 		queue_free()
 diff --git a/bullethole2.gd b/bullethole2.gd
 index f4e9dfd..0c805c0 100644
 --- a/bullethole2.gd
@@ -370,6 +604,163 @@ index 147945a..a74622f 100644
  	if fist == true:
  		$Sprite3D.hide()
  		$Sprite3D2.show()
+diff --git a/deer_mut1.gd b/deer_mut1.gd
+index cb0974a..f8a4be8 100644
+--- a/deer_mut1.gd
++++ b/deer_mut1.gd
+@@ -39,7 +39,9 @@ func _physics_process(delta):
+ 			if shooting_state == false:
+ 				var current_loc = global_transform.origin
+ 
+-				$look_forward.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++					$look_forward.look_at(next_loc, Vector3.UP)
+ 				var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 				velocity = velocity.move_toward(new_velo, 0.1)
+diff --git a/diver_enemy.gd b/diver_enemy.gd
+index 1559e01..6e7648b 100644
+--- a/diver_enemy.gd
++++ b/diver_enemy.gd
+@@ -51,7 +51,9 @@ func _physics_process(delta):
+ 	if dead_state == false and PongManager.player_inactive == false and new_manager.player_dead == false:
+ 		if searching_state == true:
+ 			var current_loc = global_transform.origin
+-			$looker.look_at(next_loc, Vector3.UP)
++			# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++			if absf(next_loc.x - $looker.global_position.x) + absf(next_loc.z - $looker.global_position.z) > 0.001:
++				$looker.look_at(next_loc, Vector3.UP)
+ 			$footsteps_spawner.rotation.y = $looker.rotation.y
+ 			var new_velo = (next_loc - current_loc).normalized() * speed
+ 			
+diff --git a/fishmonger_enemy.gd b/fishmonger_enemy.gd
+index 4320f0c..850141b 100644
+--- a/fishmonger_enemy.gd
++++ b/fishmonger_enemy.gd
+@@ -70,7 +70,9 @@ func _physics_process(delta):
+ 		if searching_state == true:
+ 			if shooting_state == false:
+ 				var current_loc = global_transform.origin
+-				$look_forward.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++					$look_forward.look_at(next_loc, Vector3.UP)
+ 				var new_velo = (next_loc - current_loc).normalized() * speed
+ 				if alt_move == true:
+ 					new_velo = (next_loc_spawner - current_loc).normalized() * speed
+diff --git a/gasmask_enemy.gd b/gasmask_enemy.gd
+index 959d487..4be65e1 100644
+--- a/gasmask_enemy.gd
++++ b/gasmask_enemy.gd
+@@ -67,7 +67,9 @@ func _physics_process(delta):
+ 				if move_to_mg == false:
+ 					var current_loc = global_transform.origin
+ 
+-					$look_forward.look_at(next_loc, Vector3.UP)
++					# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++					if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++						$look_forward.look_at(next_loc, Vector3.UP)
+ 					var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 					velocity = velocity.move_toward(new_velo, 0.1)
+@@ -77,7 +79,9 @@ func _physics_process(delta):
+ 				if move_to_mg == true:
+ 					var current_loc = global_transform.origin
+ 
+-					$look_forward.look_at(next_loc2, Vector3.UP)
++					# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++					if absf(next_loc2.x - $look_forward.global_position.x) + absf(next_loc2.z - $look_forward.global_position.z) > 0.001:
++						$look_forward.look_at(next_loc2, Vector3.UP)
+ 					var new_velo = (next_loc2 - current_loc).normalized() * speed
+ 
+ 					velocity = velocity.move_toward(new_velo, 0.1)
+diff --git a/gasmask_enemy_rpg.gd b/gasmask_enemy_rpg.gd
+index ce98a81..65741bd 100644
+--- a/gasmask_enemy_rpg.gd
++++ b/gasmask_enemy_rpg.gd
+@@ -70,7 +70,9 @@ func _physics_process(delta):
+ 				if move_to_mg == false:
+ 					var current_loc = global_transform.origin
+ 
+-					$look_forward.look_at(next_loc, Vector3.UP)
++					# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++					if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++						$look_forward.look_at(next_loc, Vector3.UP)
+ 					var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 					velocity = velocity.move_toward(new_velo, 0.1)
+@@ -80,7 +82,9 @@ func _physics_process(delta):
+ 				if move_to_mg == true:
+ 					var current_loc = global_transform.origin
+ 
+-					$look_forward.look_at(next_loc2, Vector3.UP)
++					# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++					if absf(next_loc2.x - $look_forward.global_position.x) + absf(next_loc2.z - $look_forward.global_position.z) > 0.001:
++						$look_forward.look_at(next_loc2, Vector3.UP)
+ 					var new_velo = (next_loc2 - current_loc).normalized() * speed
+ 
+ 					velocity = velocity.move_toward(new_velo, 0.1)
+diff --git a/kgb_enemy.gd b/kgb_enemy.gd
+index fe2dc9f..98d6e0f 100644
+--- a/kgb_enemy.gd
++++ b/kgb_enemy.gd
+@@ -59,7 +59,9 @@ func _physics_process(delta):
+ 			if shooting_state == false:
+ 				var current_loc = global_transform.origin
+ 
+-				$look_forward.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++					$look_forward.look_at(next_loc, Vector3.UP)
+ 				var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 				velocity = velocity.move_toward(new_velo, 0.1)
+diff --git a/kgb_enemy_mg.gd b/kgb_enemy_mg.gd
+index 2a743b7..aba3e4c 100644
+--- a/kgb_enemy_mg.gd
++++ b/kgb_enemy_mg.gd
+@@ -60,7 +60,9 @@ func _physics_process(delta):
+ 			if shooting_state == false:
+ 				var current_loc = global_transform.origin
+ 
+-				$look_forward.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++					$look_forward.look_at(next_loc, Vector3.UP)
+ 				var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 				velocity = velocity.move_toward(new_velo, 0.1)
+diff --git a/kgb_enemy_psi.gd b/kgb_enemy_psi.gd
+index aa77994..5e5f775 100644
+--- a/kgb_enemy_psi.gd
++++ b/kgb_enemy_psi.gd
+@@ -59,7 +59,9 @@ func _physics_process(delta):
+ 			if shooting_state == false:
+ 				var current_loc = global_transform.origin
+ 
+-				$look_forward.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++					$look_forward.look_at(next_loc, Vector3.UP)
+ 				var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 				velocity = velocity.move_toward(new_velo, 0.1)
+diff --git a/leshy_enemy.gd b/leshy_enemy.gd
+index 8e58343..6cad960 100644
+--- a/leshy_enemy.gd
++++ b/leshy_enemy.gd
+@@ -56,7 +56,9 @@ func _physics_process(delta):
+ 		if searching_state == true:
+ 			if shooting_state == false:
+ 				var current_loc = global_transform.origin
+-				$look_forward.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++					$look_forward.look_at(next_loc, Vector3.UP)
+ 				var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 				velocity = velocity.move_toward(new_velo, 0.2)
 diff --git a/new_manager.gd b/new_manager.gd
 index 2231577..38b3e4c 100644
 --- a/new_manager.gd
@@ -414,7 +805,7 @@ index 2231577..38b3e4c 100644
 +		if is_instance_valid(oldest):
 +			oldest.queue_free()
 diff --git a/player.gd b/player.gd
-index dbdfc88..972a2e6 100644
+index dbdfc88..ad0583c 100644
 --- a/player.gd
 +++ b/player.gd
 @@ -142,6 +142,7 @@ var time := 0.0
@@ -483,7 +874,67 @@ index dbdfc88..972a2e6 100644
  
  	if Input.is_action_just_pressed("shoot") and Gamemanager.cur_wep_is_main_eqip == false and Gamemanager.clip_2 < 1 and menu_hover == false and PongManager.player_inactive == false:
  		if Gamemanager.current_weapon_sidearm < 31:
-@@ -15759,3 +15774,73 @@ func _on_puppet_spawner_timer_timeout():
+@@ -12910,18 +12925,7 @@ func _physics_process(delta):
+ 						$expvis.hide()
+ 
+ 		if pickedup_item > 0 and skip2 == false:
+-			var can_put_down = true
+-			for body11 in $head/Camera3D/lighter_vis/spawner/Area3D.get_overlapping_bodies():
+-				if body11:
+-					$denied.play()
+-					$info3.text = "Not enough space."
+-					$info_num.text = " "
+-					can_put_down = false
+-				if $head/Camera3D/lighter_vis/spawner/item_spawn_check.is_colliding():
+-					$denied.play()
+-					$info3.text = "Not enough space."
+-					$info_num.text = " "
+-					can_put_down = false
++			var can_put_down = sp_can_place(true)
+ 			if can_put_down == true and throwing == false:
+ 				if pickedup_item == 1:
+ 					var instance = item_box.instantiate()
+@@ -12980,18 +12984,7 @@ func _physics_process(delta):
+ 				pickedup_item = 0
+ 				throwing = false
+ 			if pickedup_item == 2:
+-				var can_put_down = true
+-				for body11 in $head/Camera3D/lighter_vis/spawner/Area3D.get_overlapping_bodies():
+-					if body11:
+-						$denied.play()
+-						$info3.text = "Not enough space."
+-						$info_num.text = " "
+-						can_put_down = false
+-					if $head/Camera3D/lighter_vis/spawner/item_spawn_check.is_colliding():
+-						$denied.play()
+-						$info3.text = "Not enough space."
+-						$info_num.text = " "
+-						can_put_down = false
++				var can_put_down = sp_can_place(false)
+ 				if can_put_down == true:
+ 					throwing = true
+ 					$throw.play()
+@@ -13071,18 +13064,7 @@ func _physics_process(delta):
+ 				pickedup_item = 0
+ 				throwing = false
+ 			if pickedup_item == 5:
+-				var can_put_down = true
+-				for body11 in $head/Camera3D/lighter_vis/spawner/Area3D.get_overlapping_bodies():
+-					if body11:
+-						$denied.play()
+-						$info3.text = "Not enough space."
+-						$info_num.text = " "
+-						can_put_down = false
+-					if $head/Camera3D/lighter_vis/spawner/item_spawn_check.is_colliding():
+-						$denied.play()
+-						$info3.text = "Not enough space."
+-						$info_num.text = " "
+-						can_put_down = false
++				var can_put_down = sp_can_place(false)
+ 				if can_put_down == true:
+ 					throwing = true
+ 					$throw.play()
+@@ -15759,3 +15741,115 @@ func _on_puppet_spawner_timer_timeout():
  			$puppet_spawner_timer.wait_time = randi_range(35, 190)
  		else:
  			$puppet_timer.start()
@@ -557,6 +1008,48 @@ index dbdfc88..972a2e6 100644
 +	$health/body.animation = "crouch"
 +	$crouch.play("new_animation")
 +	sp_apply_crouch_shape(true)
++
++# ---- SONAR PATCH: item placement fix ----
++# The shipped drop/throw check used a fixed 0.65 Area3D cube 0.65m below the
++# camera: crouching sank it into the floor (guaranteed "Not enough space."
++# softlock — barrels/mines can't be thrown either), and its size matched no
++# carried item. Replaced with a direct-space query sized per item, anchored
++# just above the spawn point. The forward item_spawn_check ray is kept so a
++# point-blank wall still denies (and throws can't spawn beyond a wall).
++
++func sp_can_place(check_volume: bool) -> bool:
++	var blocked = $head/Camera3D/lighter_vis/spawner/item_spawn_check.is_colliding()
++	if not blocked and check_volume:
++		var w = get_world_3d()
++		if w == null or w.direct_space_state == null:
++			for body11 in $head/Camera3D/lighter_vis/spawner/Area3D.get_overlapping_bodies():
++				if body11 != null and body11 != self:
++					blocked = true
++		else:
++			var shape = CylinderShape3D.new()
++			if pickedup_item == 2:      # barrel: real collider r~0.45 h~1.12 above origin
++				shape.radius = 0.4
++				shape.height = 1.0
++			elif pickedup_item == 1:    # crate
++				shape.radius = 0.35
++				shape.height = 0.6
++			else:                        # fire ext / flare / soma mine
++				shape.radius = 0.25
++				shape.height = 0.4
++			var params = PhysicsShapeQueryParameters3D.new()
++			params.shape = shape
++			var origin = $head/Camera3D/lighter_vis/spawner.global_transform.origin
++			origin.y += shape.height * 0.5 + 0.06
++			params.transform = Transform3D(Basis(), origin)
++			params.collision_mask = 1
++			params.exclude = [get_rid()]
++			blocked = not w.direct_space_state.intersect_shape(params, 1).is_empty()
++	if blocked:
++		if not $denied.playing:
++			$denied.play()
++		$info3.text = "Not enough space."
++		$info_num.text = " "
++	return not blocked
 diff --git a/random/casing1.gd b/random/casing1.gd
 index b4a392e..6c71095 100644
 --- a/random/casing1.gd
@@ -569,6 +1062,35 @@ index b4a392e..6c71095 100644
  	if type == 1:
  		$Sprite3D.show()
  	if type == 2:
+diff --git a/rusalka_enemy.gd b/rusalka_enemy.gd
+index 5992a18..0fc0b8a 100644
+--- a/rusalka_enemy.gd
++++ b/rusalka_enemy.gd
+@@ -55,7 +55,9 @@ func _physics_process(delta):
+ 		if searching_state == true:
+ 			if shooting_state == false:
+ 				var current_loc = global_transform.origin
+-				$look_forward.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $look_forward.global_position.x) + absf(next_loc.z - $look_forward.global_position.z) > 0.001:
++					$look_forward.look_at(next_loc, Vector3.UP)
+ 				var new_velo = (next_loc - current_loc).normalized() * speed
+ 
+ 				velocity = velocity.move_toward(new_velo, 0.1)
+diff --git a/steam_jumpscare.gd b/steam_jumpscare.gd
+index 06d0982..c8a186c 100644
+--- a/steam_jumpscare.gd
++++ b/steam_jumpscare.gd
+@@ -34,8 +34,7 @@ func _process(delta):
+ 	pass
+ 
+ func _on_loaded_avatar(user_id: int, avatar_size: int, avatar_buffer: PackedByteArray) -> void:
+-	print("Avatar for user: %s" % user_id)
+-	print("Size: %s" % avatar_size)
++	# SONAR PATCH: debug prints removed (synchronous console writes mid-frame)
+ 
+ 	# Create the image and texture for loading
+ 	var avatar_image: Image = Image.create_from_data(avatar_size, avatar_size, false, Image.FORMAT_RGBA8, avatar_buffer)
 diff --git a/sword_bullethole.gd b/sword_bullethole.gd
 index d3ce117..1a65ad0 100644
 --- a/sword_bullethole.gd
@@ -581,3 +1103,18 @@ index d3ce117..1a65ad0 100644
  	randomize()
  	var rndom_num = randf_range(0, 5)
  	rndom_num = int(rndom_num)
+diff --git a/tank_enemy.gd b/tank_enemy.gd
+index 1f9639f..2103f37 100644
+--- a/tank_enemy.gd
++++ b/tank_enemy.gd
+@@ -50,7 +50,9 @@ func _physics_process(delta):
+ 	if dead_state == false and PongManager.player_inactive == false and new_manager.player_dead == false:
+ 		if searching_state == true:
+ 			if shooting_state == false:
+-				$looker_path.look_at(next_loc, Vector3.UP)
++				# SONAR PATCH: guard degenerate look_at (equal or vertically-aligned target spams an engine error every physics frame)
++				if absf(next_loc.x - $looker_path.global_position.x) + absf(next_loc.z - $looker_path.global_position.z) > 0.001:
++					$looker_path.look_at(next_loc, Vector3.UP)
+ 				var min_rot = $looker_path.rotation_degrees.y
+ 				var max_rot = $looker_path.rotation_degrees.y
+ 				min_rot -= 10

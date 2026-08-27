@@ -1,12 +1,13 @@
 # =============================================================================
-#  Sonar Shock — Community Bugfix Patch v1.0
+#  Sonar Shock — Community Bugfix Patch (version in $PatchVersion below)
 #  Fixes: stuck-under-objects after crouching, long-session framerate collapse
-#         ("memory leak"), low-sanity elevator soft-lock, minor script bugs.
+#         ("memory leak"), low-sanity elevator soft-lock, stuck-carrying-barrel,
+#         floor-3/combat stutter, minor script bugs.
 #
 #  What this script does, in order:
 #    1. Finds your "Sonar Shock.pck" and checks its SHA-256 fingerprint.
 #       It ONLY proceeds on the exact game build this patch was made for.
-#    2. Reads the 12 affected scripts out of your own pck, applies the changes
+#    2. Reads the affected scripts out of your own pck, applies the changes
 #       from SonarShock_bugfixes.patch in memory, and verifies every result
 #       against known-good fingerprints. Any mismatch -> it stops, changing
 #       nothing.
@@ -20,16 +21,16 @@
 # =============================================================================
 $ErrorActionPreference = 'Stop'
 
-$PatchVersion      = '1.0'
+$PatchVersion      = '1.2'
 $PatchFileName     = 'SonarShock_bugfixes.patch'
 $OriginalPckSha256 = '98332c90d863c6ecf975cc29342608ef2a8732787de9f10fbc459cdd1ead7e01'
-$PatchedPckSha256  = '9f03f18b2aae68e873c8b0d77778834b6c6dd7088f315961126270d81fd7c11e'
+$PatchedPckSha256  = '5115c6bcc318b0640f64c5c5d8747566776e31743c35592701a35dafd2f01a49'
 $OriginalPckSize   = 1724726304
 # Files in pck append order; per-file SHA-256 of the original and patched bytes.
 $Files = [ordered]@{
-    'player.gd' = @{ Orig = 'c91fee5a5a58d6307250e856bc46ccee461a2a5b3fc870d9d005dcb666e46627'; New = '730900597b7c93f68da327140e66be4b28429746d086715644b43a59c7c63d18' }
+    'player.gd' = @{ Orig = 'c91fee5a5a58d6307250e856bc46ccee461a2a5b3fc870d9d005dcb666e46627'; New = 'cca0753030d3c4a9935185ce4afa7dd8252e91cb736f3ef3a3e7522f2d23d6de' }
     'new_manager.gd' = @{ Orig = '6bb32645c7c61dc0876356348c563c228011a088701bb67bfb0cd4f571765c3c'; New = '87cb1ed2f8a610b82f7c73e009367f375e7a0dec99e90386dee6c30f04247b08' }
-    'Maps/main_scene.gd' = @{ Orig = '1401ae60e6952db6d7b56fad6b7e2505347d56693f924d243f4e82205794f4ff'; New = 'ae19ebfbecc52fffce9817a7da249ac8105b6b17d8bf850574bfdb4e511e9f30' }
+    'Maps/main_scene.gd' = @{ Orig = '1401ae60e6952db6d7b56fad6b7e2505347d56693f924d243f4e82205794f4ff'; New = '35ac5ace8f73b2e386e63f9276409d439288b6b9de4d192d6e5e82033ee6c0ff' }
     'bullethole2.gd' = @{ Orig = '93d6506fe0466aa234e4a736feed2819ec8e7d0d1bcb216cde0f84385fdc91da'; New = '923ed154573fab57cad1f5a3ac67fac628b8fe5fa310f8ff983c9c5cdb36408d' }
     'bullethole4.gd' = @{ Orig = '29d119acd14df8aa6ed22e8da453a172b1f53e4c3513310016598d8b051a35fd'; New = '531660cfb4dccce67d785b6d0be645b36dcc4d86ee67415abf73a3a442c6fe85' }
     'bullethole5.gd' = @{ Orig = '5dd79109dd227c96f70a944af04051f34862eb37b763de2ee1e82e77e79134c4'; New = 'dbc78f4595209c188c038251e90a9d4a1f762aefebccf93abb4bd88175bfc506' }
@@ -37,8 +38,21 @@ $Files = [ordered]@{
     'bullethole_melee.gd' = @{ Orig = '0914f2522eec947275398a777e46fbd22bdb4a5260ad0bcd87632f40b5c2412a'; New = '31f78ed25eeca0e06e10c096822fa23f88350e96556c1702c44aa6b11748bd01' }
     'sword_bullethole.gd' = @{ Orig = 'bfde5450183a079bf9a8061b3c8fed9c4696b7714e27d998e2b73a625dddc437'; New = '92e1e6194b29dfe4b786f1b29415c1558aaa0d748b56f980779dcb246f27bd7f' }
     'blood_splatter.gd' = @{ Orig = '99a51ac69729875850ad2876dde034f38f8de59c848fa486a0ae2e6602c524aa'; New = '2d4724ec4e49b03552573366c0319d53d399bc51e6efc43e26600bcd4ff39c54' }
-    'blood_sprite.gd' = @{ Orig = '918678bfd324ae5ae6b8cf1f25238c80ce07440b269ed76e6d9f767e49c23e27'; New = '37755167d2e90f70f6be7ecd36343b0d9e95d8e1fb344852bb0fa66532ef2547' }
+    'blood_sprite.gd' = @{ Orig = '918678bfd324ae5ae6b8cf1f25238c80ce07440b269ed76e6d9f767e49c23e27'; New = 'c5c3b4627ea0dc3455c3b8f71932f981d7183ddba9e48e48d8e3c14fd651accf' }
     'random/casing1.gd' = @{ Orig = '070cd87a48360fe7238bba34fc533515e67c6fd77df040675a88978fc302b0a9'; New = 'de0d79f094b58bd2f29ca4ec65e78fa06aa24e8822e0bd2323b635ed60a5cdca' }
+    'Maps/Map3.gd' = @{ Orig = '8edc98853d89eb4a34ebfa04a4922a4503c4837feaa90d5aa0ee7ba89211dfc3'; New = 'ad6ea52da5fb5bbc63ae6fce050d103e13f2c4b764d3cf71aa8d8bcd446216ed' }
+    'steam_jumpscare.gd' = @{ Orig = '890e95ffebad824d32aaf2b3f28c4d785b48f84b16b0bd50169df5750f18ed27'; New = '7d1ae132f46ec56928f0da25781cf44d7e598274ae8cb759381eb6d02ddc1f20' }
+    'fishmonger_enemy.gd' = @{ Orig = '8b459fea6ab57323644dc3c5fe801aed19b77afe9a05bf58c1395c0666bdee59'; New = '728e2da4aa90a20b3b413854e2d344544e91466e6875fbf910f62a2cbc022cf8' }
+    'deer_mut1.gd' = @{ Orig = '84bd901276c0b1e54a32c9c57572edbedc1138b092f5327c9f5f7e70714dc034'; New = '07f59e7a13a5c8d5e98b34b64110587eab5c04476a85a388d3f25110d956960d' }
+    'kgb_enemy_psi.gd' = @{ Orig = '04ea4273e10834f02295c43b4560f8ad42c60bbae8e1edcce7e7b3b31dca3e29'; New = '8b1e5f24c9824dffcf1e5417071b53fd118007ff2d4d205140bd5cddd276882a' }
+    'diver_enemy.gd' = @{ Orig = '61233593dcef2c491acd70e413e002de6ada1294372ea4bcdaee1c0748bdc461'; New = '6595c225a78da4edee51f30d797e9b4d81e5f4ad91a9fe4f1c617d39c6718c1e' }
+    'gasmask_enemy.gd' = @{ Orig = 'd0a10038add81a4e4bde41a8d544ec8a4934b413440efa637bf29de393315430'; New = '1e568dedd7035cb6d1fc98d73080d599c18069fb90ee3100a1a5417b802c8463' }
+    'kgb_enemy_mg.gd' = @{ Orig = '457c2b2ebc338e1bdaca1223248b1b204c3f4bb350e6bfd20f6384f67e2eb332'; New = '433b25cbae887d4961acb4250d2bbca3a2939946a1570ea5f753bc6fb202c457' }
+    'gasmask_enemy_rpg.gd' = @{ Orig = '704e7de87cebac74cf174a331f635f9d90219a421846e0f575b0798cfe6ef227'; New = 'c18ee33df435e1e83fb3e20425221b4d84bfb94b24e9cbcef2a44c4a8119e9b7' }
+    'leshy_enemy.gd' = @{ Orig = '617b5526be8548f8c527b9359e47e4f568286af1985443c5ecddaad2ad6cd088'; New = '37b09ea4802f299977d701ad0e631368571f72b7c836e76c436e53793736affe' }
+    'kgb_enemy.gd' = @{ Orig = '6de4e5e0d8d05ef39fd2ee30cae9ac14951fe7934a03b18f6c25613d2bc2f2a3'; New = 'b2daa057f35a376231eeeca351bb97eb0ebabbdfb17c19bd65cad8246d0f68d5' }
+    'rusalka_enemy.gd' = @{ Orig = 'b66e59f29e9c65dd5b0c043ab6cb8fed63244007ecc3216ccd981c7b95eb7b7e'; New = '5181455f6a5fdb49aee92206644a57a7107ae69eb641a06cfa7a068fbe10dd7f' }
+    'tank_enemy.gd' = @{ Orig = '9e7c754a8a62329b07a4db8f84ed04e4224de077747beb35943f325be9c53563'; New = 'a0c7c9aa7530fca86bb0f19b872cbb7ccdcfb61e6bb21dacde69fa5545b98c32' }
 }
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -347,7 +361,7 @@ try {
 
     Write-Host ''
     Write-Ok 'SUCCESS - Sonar Shock is patched. Enjoy!'
-    Write-Step 'Fixed: crouch stuck-in-geometry, long-session FPS decay, elevator soft-lock, misc.'
+    Write-Step 'Fixed: crouch stuck-in-geometry, long-session FPS decay, elevator soft-lock, stuck-carrying-barrel, floor-3/combat stutter, misc.'
     Write-Step 'Your original data is kept as "Sonar Shock.pck.orig".'
     Write-Step 'To undo: run RestoreOriginal.bat.'
     $exitCode = 0
